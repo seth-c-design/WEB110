@@ -4,92 +4,53 @@ import { promises as fs } from 'fs';
 import path from 'path';
 
 // --- Configuration ---
-const PROMPT_TEMPLATE_PATH = 'assets/Prompt_template.json';
 const MODEL_OPTIONS = [
-  'gemini-2.5-flash-lite',      // Primary: fastest/cheapest free-tier friendly
-  'gemini-2.5-flash',           // Solid backup
-  'gemini-flash-latest'         // Alias for newest stable Flash
+  'gemini-2.5-flash-lite',   // Primary - fast & reliable on free tier
+  'gemini-2.5-flash',
+  'gemini-flash-latest'
 ];
 
 const GENERATION_CONFIG = {
-  temperature: 1.1,
+  temperature: 1.0,
   topP: 0.95,
-  maxOutputTokens: 8192,
-  responseMimeType: "application/json",
-  responseJsonSchema: {
-    // Paste the entire schema object from above here if you want even stricter enforcement
-    // (or keep it simple and rely on the system prompt + template)
-  }
+  maxOutputTokens: 4096,
 };
 
-const getSystemPrompt = (template) => `
-You are a specialized AI assistant for generating video prompts for Google's VEO model.
+// --- Midjourney System Prompt ---
+const getSystemPrompt = () => `
+You are an expert Midjourney prompt engineer.
 
-CRITICAL INSTRUCTIONS:
-- You MUST output ONLY valid JSON that exactly matches the provided JSON Schema.
-- Do not add any text, explanations, markdown, or comments outside the JSON.
-- Follow every property, type, and constraint in the schema.
-- Keep total duration ≤ 8 seconds.
-- Be extremely detailed and cinematic in all descriptions.
+Your job is to take a user's simple idea (and optional reference image) and turn it into a high-quality, detailed Midjourney prompt.
 
-Here is the exact JSON Schema you must follow:
-${template}
+Rules:
+- Output in clear, readable sections with headings.
+- Be highly descriptive and cinematic/artistic.
+- Include subject details, lighting, mood, composition, camera angle, and artistic style.
+- Suggest good Midjourney parameters at the end (--ar, --v, --stylize, --q, etc.).
+- If an image is provided, analyze it and incorporate relevant visual elements, style, or composition from it.
 
-Now generate the filled JSON for the user's idea.
+Format your response like this:
+
+**Optimized Midjourney Prompt**
+[Full ready-to-copy Midjourney prompt here]
+
+**Breakdown**
+**Foreground:** ...
+**Midground:** ...
+**Background:** ...
+**Style & Mood:** ...
+**Lighting & Atmosphere:** ...
+
+**Recommended Parameters**
+--ar ... --v 6 --stylize ... etc.
 `;
 
-const getFilepathToPromptTemplate = () => {
-  const isVercel = process.env.VERCEL;
-  return isVercel 
-    ? path.join(process.cwd(), PROMPT_TEMPLATE_PATH) 
-    : PROMPT_TEMPLATE_PATH;
-};
-
-// Helper for model fallback
-async function tryGenerate(genAI, userPrompt, template, imageData = null) {
-  for (const modelName of MODEL_OPTIONS) {
-    try {
-      const model = genAI.getGenerativeModel({ model: modelName });
-      const parts = [
-        { text: getSystemPrompt(template) },
-        { text: template },
-        { text: userPrompt },
-      ];
-
-      if (imageData) {
-        parts.push(imageData);
-      }
-
-      const result = await model.generateContent({
-        contents: [{ role: 'user', parts }],
-        generationConfig: GENERATION_CONFIG,
-      });
-
-      console.log(`✅ Success with model: ${modelName}`);
-      return result.response.text();
-    } catch (e) {
-      console.warn(`⚠️ Model ${modelName} failed:`, e.message);
-      if (e.message?.includes('quota') || e.status === 429) {
-        throw e; // Surface quota errors immediately for frontend handling
-      }
-      // Continue to next model on other errors
-    }
-  }
-  throw new Error('All models failed. Free tier may be busy.');
-}
-
-// --- Main Handler ---
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    // 1. Read template
-    const templatePath = getFilepathToPromptTemplate();
-    const template = await fs.readFile(templatePath, 'utf-8');
-
-    // 2. Parse form
     const form = formidable({ multiples: false });
     const [fields, files] = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) => {
@@ -99,52 +60,73 @@ export default async function handler(req, res) {
     });
 
     const userPrompt = fields.userPrompt?.[0] || '';
-    if (!userPrompt.trim()) {
-      return res.status(400).json({ error: 'Prompt cannot be empty.' });
+    const imageUrl = fields.imageUrl?.[0] || '';
+
+    if (!userPrompt.trim() && !imageUrl && !files.image?.[0]) {
+      return res.status(400).json({ error: 'Please provide a prompt or an image.' });
     }
 
-    // 3. Prepare Gemini
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-    let imageData = null;
+    const parts = [
+      { text: getSystemPrompt() },
+      { text: `User's idea: ${userPrompt}` },
+    ];
+
+    // Handle uploaded image file
     if (files.image?.[0]) {
       const file = files.image[0];
       const buffer = await fs.readFile(file.filepath);
-      imageData = {
+      parts.push({
         inlineData: {
           mimeType: file.mimetype || 'image/jpeg',
           data: buffer.toString('base64'),
         },
-      };
-      await fs.unlink(file.filepath).catch(() => {}); // Cleanup
-    }
-
-    // 4. Generate with fallback
-    const responseText = await tryGenerate(genAI, userPrompt, template, imageData);
-
-    // 5. Validate & respond
-    try {
-      const jsonResponse = JSON.parse(responseText);
-      res.status(200).json({ 
-        optimizedText: JSON.stringify(jsonResponse, null, 2),
-        modelUsed: 'success' // Optional: you can track which model succeeded if desired
       });
-    } catch (e) {
-      console.error("JSON parse failed:", responseText);
-      res.status(500).json({ error: "AI returned invalid JSON. Please try again." });
+      await fs.unlink(file.filepath).catch(() => {});
     }
+
+    // Handle image URL (if frontend sends one)
+    if (imageUrl) {
+      parts.push({ text: `Reference image URL: ${imageUrl}` });
+    }
+
+    // Model fallback
+    let result;
+    let lastError;
+
+    for (const modelName of MODEL_OPTIONS) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelName });
+        result = await model.generateContent({
+          contents: [{ role: 'user', parts }],
+          generationConfig: GENERATION_CONFIG,
+        });
+        console.log(`✅ Used model: ${modelName}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`Model ${modelName} failed:`, err.message);
+        if (err.message?.toLowerCase().includes('quota') || err.status === 429) {
+          throw err;
+        }
+      }
+    }
+
+    if (!result) throw lastError || new Error('All models failed');
+
+    const responseText = result.response.text();
+
+    res.status(200).json({ optimizedText: responseText });
 
   } catch (error) {
     console.error('API Error:', error);
 
-    let userMessage = `An internal server error occurred: ${error.message}`;
-    
-    if (error.message?.toLowerCase().includes('quota') || error.status === 429) {
-      userMessage = "Free tier is busy right now — please wait 30-60 seconds and try again.";
-    } else if (error.message?.includes('API key') || error.status === 401) {
-      userMessage = "API key issue. Check your Vercel environment variable.";
+    let message = error.message || 'Something went wrong';
+    if (message.toLowerCase().includes('quota') || error.status === 429) {
+      message = "Free tier is busy — please wait 30-60 seconds and try again.";
     }
 
-    res.status(500).json({ error: userMessage });
+    res.status(500).json({ error: message });
   }
 }
